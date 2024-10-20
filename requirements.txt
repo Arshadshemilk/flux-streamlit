@@ -3,3 +3,4 @@ openai
 fal_client
 asyncio
 pillow
+python-dotenv
