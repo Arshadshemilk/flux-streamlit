@@ -9,3 +9,4 @@ torchvision
 transformers
 invisible-watermark
 opencv-python-headless
+sentencepiece
