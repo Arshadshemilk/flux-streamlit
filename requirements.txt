@@ -1,8 +1,8 @@
 glob2
 Python-IO
-torch
+torch >= 2.0.0
 einops
-fire
+fire >= 0.6.0
 pillow
 streamlit-keyup
 torchvision
@@ -10,3 +10,8 @@ transformers
 invisible-watermark
 opencv-python-headless
 sentencepiece
+safetensors
+tokenizers
+huggingface-hub
+requests
+protobuf
