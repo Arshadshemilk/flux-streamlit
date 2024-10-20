@@ -1,16 +1,5 @@
-glob2
-Python-IO
-torch >= 2.0.0
-einops
-fire >= 0.6.0
+streamlit
+openai
+fal_client
+asyncio
 pillow
-streamlit-keyup
-torchvision
-transformers
-invisible-watermark
-opencv-python-headless
-sentencepiece
-safetensors
-tokenizers
-huggingface-hub
-requests
