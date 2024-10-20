@@ -144,7 +144,7 @@ def save_image_and_markdown(url, prompt, result, model, image_size, num_inferenc
 
 def main():
     st.title("🤖 Image Generation with fal.ai & Flux")
-    secrets = dotenv_values(".env")
+    secrets = st.secrets
     FAL_KEY = secrets["FAL_KEY"]
     os.environ['FAL_KEY'] = FAL_KEY
 
