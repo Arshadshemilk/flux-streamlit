@@ -146,6 +146,8 @@ def save_image_and_markdown(url, prompt, result, model, image_size, num_inferenc
 
 def main():
     st.title("🤖 Image Generation with fal.ai & Flux")
+    fal_api_key = "5de835de-2f76-41f2-b11b-02bafb056857:a9557fac741d4dfd1d16eca237e696e5"
+    os.environ['FAL_KEY'] = fal_api_key
 
     # Check for environment variables
     if not os.getenv("FAL_KEY"):
