@@ -7,3 +7,4 @@ pillow
 streamlit-keyup
 torchvision
 transformers
+imWatermark
