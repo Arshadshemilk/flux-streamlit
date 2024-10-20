@@ -1,293 +1,306 @@
-import os
-import re
-import time
-from glob import iglob
-from io import BytesIO
-
 import streamlit as st
-import torch
-from einops import rearrange
-from fire import Fire
-from PIL import ExifTags, Image
-from st_keyup import st_keyup
-from torchvision import transforms
-from transformers import pipeline
+import openai
+import fal_client
+import asyncio
+import os
+import time
+import itertools
+import requests
+from PIL import Image
+from io import BytesIO
+from datetime import datetime
 
-from flux.cli import SamplingOptions
-from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
-from flux.util import (
-    configs,
-    embed_watermark,
-    load_ae,
-    load_clip,
-    load_flow_model,
-    load_t5,
-)
-
-NSFW_THRESHOLD = 0.85
-
-
-@st.cache_resource()
-def get_models(name: str, device: torch.device, offload: bool, is_schnell: bool):
-    t5 = load_t5(device, max_length=256 if is_schnell else 512)
-    clip = load_clip(device)
-    model = load_flow_model(name, device="cpu" if offload else device)
-    ae = load_ae(name, device="cpu" if offload else device)
-    nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection", device=device)
-    return model, ae, t5, clip, nsfw_classifier
-
-
-def get_image() -> torch.Tensor | None:
-    image = st.file_uploader("Input", type=["jpg", "JPEG", "png"])
-    if image is None:
-        return None
-    image = Image.open(image).convert("RGB")
-
-    transform = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: 2.0 * x - 1.0),
+def tune_prompt_with_openai(prompt, model):
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    
+    client = openai.OpenAI(api_key=openai_api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an advanced AI assistant specialized in refining and enhancing image generation prompts. Your goal is to help users create more effective, detailed, and creative prompts for high-quality images. Respond with: 1) An improved prompt (prefix with 'PROMPT:'), 2) Explanation of changes (prefix with 'EXPLANATION:'), and 3) Additional suggestions (prefix with 'SUGGESTIONS:'). Each section should be on a new line."
+            },
+            {
+                "role": "user",
+                "content": f"Improve this image generation prompt: {prompt}"
+            }
         ]
     )
-    img: torch.Tensor = transform(image)
-    return img[None, ...]
+    return response.choices[0].message.content.strip()
 
+async def generate_image_with_fal(prompt, model, image_size, num_inference_steps, guidance_scale, num_images, safety_tolerance):
+    fal_api_key = os.getenv("FAL_KEY")
+    if not fal_api_key:
+        raise ValueError("FAL_KEY environment variable is not set")
+    
+    os.environ['FAL_KEY'] = fal_api_key  # Set the API key as an environment variable
+    
+    handler = await fal_client.submit_async(
+        model,
+        arguments={
+            "prompt": prompt,
+            "image_size": image_size,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "num_images": num_images,
+            "safety_tolerance": safety_tolerance
+        }
+    )
 
-@torch.inference_mode()
-def main(
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    offload: bool = False,
-    output_dir: str = "output",
-):
-    torch_device = torch.device(device)
-    names = list(configs.keys())
-    name = st.selectbox("Which model to load?", names)
-    if name is None or not st.checkbox("Load model", False):
+    # Wait for the actual result instead of returning immediately
+    result = await handler.get()
+    return result
+
+def cycle_spinner_messages():
+    messages = [
+        "🎨 Mixing colors...",
+        "✨ Sprinkling creativity dust...",
+        "🖌️ Applying artistic strokes...",
+        "🌈 Infusing with vibrant hues...",
+        "🔍 Focusing on details...",
+        "🖼️ Framing the masterpiece...",
+        "🌟 Adding that special touch...",
+        "🎭 Bringing characters to life...",
+        "🏙️ Building the scene...",
+        "🌅 Setting the perfect mood...",
+    ]
+    return itertools.cycle(messages)
+
+async def run_with_spinner(generation_coroutine, spinner_placeholder, message_cycle):
+    task = asyncio.create_task(generation_coroutine)
+    while not task.done():
+        spinner_placeholder.text(next(message_cycle))
+        await asyncio.sleep(3)
+    return await task
+
+def accept_tuned_prompt():
+    st.session_state.user_prompt = st.session_state.tuned_prompt
+    st.session_state.prompt_accepted = True
+
+def format_markdown(prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance):
+    markdown = f"""# Image Generation Results
+
+## Prompt
+{prompt}
+
+## Generation Details
+- **Date and Time:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+- **Model:** {model}
+- **Seed:** {result.get('seed', 'Not specified')}
+- **NSFW Concepts Detected:** {result.get('has_nsfw_concepts', 'Not specified')}
+- **Image Size:** {image_size}
+- **Number of Inference Steps:** {num_inference_steps}
+- **Guidance Scale:** {guidance_scale}
+- **Safety Tolerance:** {safety_tolerance}
+
+## Image URL
+{result['images'][0]['url'] if 'images' in result and result['images'] else 'No image URL available'}
+
+"""
+    return markdown
+
+def save_image_and_markdown(url, prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance):
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            image = Image.open(BytesIO(response.content))
+            
+            # Create a filename using the current date and time
+            timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+            
+            # Sanitize the prompt to create a valid filename
+            safe_prompt = "".join(c for c in prompt if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_prompt = safe_prompt[:50]  # Limit the length of the prompt in the filename
+            
+            filename_base = f"{timestamp}_{safe_prompt}"
+            
+            # Ensure the images directory exists
+            images_folder = os.path.join(os.path.dirname(__file__), 'images')
+            os.makedirs(images_folder, exist_ok=True)
+            
+            # Save the image
+            image_filename = f"{filename_base}.png"
+            full_image_path = os.path.join(images_folder, image_filename)
+            image.save(full_image_path)
+            
+            # Save the Markdown data
+            markdown_filename = f"{filename_base}.md"
+            full_markdown_path = os.path.join(images_folder, markdown_filename)
+            markdown_content = format_markdown(prompt, result, model, image_size, num_inference_steps, guidance_scale, safety_tolerance)
+            with open(full_markdown_path, 'w', encoding='utf-8') as md_file:
+                md_file.write(markdown_content)
+            
+            # Verify that the Markdown file is not empty
+            if os.path.getsize(full_markdown_path) == 0:
+                raise IOError("Markdown file is empty after writing")
+            
+            return full_image_path, full_markdown_path
+        else:
+            raise IOError(f"Failed to download image. Status code: {response.status_code}")
+    except Exception as e:
+        print(f"Error in save_image_and_markdown: {str(e)}")
+        return None, None
+
+def main():
+    st.title("🤖 Image Generation with fal.ai & Flux")
+
+    # Check for environment variables
+    if not os.getenv("FAL_KEY"):
+        st.error("FAL_KEY environment variable is not set. Please set it before running the app.")
         return
 
-    is_schnell = name == "flux-schnell"
-    model, ae, t5, clip, nsfw_classifier = get_models(
-        name,
-        device=torch_device,
-        offload=offload,
-        is_schnell=is_schnell,
-    )
+    # Model selection dropdown
+    model_options = {
+        "Flux Pro": "fal-ai/flux-pro",
+        "Flux Dev": "fal-ai/flux/dev",
+        "Flux Schnell": "fal-ai/flux/schnell",
+        "Flux Realism": "fal-ai/flux-realism"
+    }
+    selected_model = st.selectbox("Select Model:", list(model_options.keys()), index=0)
 
-    do_img2img = (
-        st.checkbox(
-            "Image to Image",
-            False,
-            disabled=is_schnell,
-            help="Partially noise an image and denoise again to get variations.\n\nOnly works for flux-dev",
-        )
-        and not is_schnell
-    )
-    if do_img2img:
-        init_image = get_image()
-        if init_image is None:
-            st.warning("Please add an image to do image to image")
-        image2image_strength = st.number_input("Noising strength", min_value=0.0, max_value=1.0, value=0.8)
-        if init_image is not None:
-            h, w = init_image.shape[-2:]
-            st.write(f"Got image of size {w}x{h} ({h*w/1e6:.2f}MP)")
-        resize_img = st.checkbox("Resize image", False) or init_image is None
-    else:
-        init_image = None
-        resize_img = True
-        image2image_strength = 0.0
+    # Basic parameters
+    image_size = st.selectbox("Image Size:", ["square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9"], index=0)
+    num_inference_steps = st.slider("Number of Inference Steps:", min_value=1, max_value=50, value=28)
 
-    # allow for packing and conversion to latent space
-    width = int(
-        16 * (st.number_input("Width", min_value=128, value=1360, step=16, disabled=not resize_img) // 16)
-    )
-    height = int(
-        16 * (st.number_input("Height", min_value=128, value=768, step=16, disabled=not resize_img) // 16)
-    )
-    num_steps = int(st.number_input("Number of steps", min_value=1, value=(4 if is_schnell else 50)))
-    guidance = float(st.number_input("Guidance", min_value=1.0, value=3.5, disabled=is_schnell))
-    seed_str = st.text_input("Seed", disabled=is_schnell)
-    if seed_str.isdecimal():
-        seed = int(seed_str)
-    else:
-        st.info("No seed set, set to positive integer to enable")
-        seed = None
-    save_samples = st.checkbox("Save samples?", not is_schnell)
-    add_sampling_metadata = st.checkbox("Add sampling parameters to metadata?", True)
+    # Advanced configuration in an expander
+    with st.expander("Advanced Configuration", expanded=False):
+        guidance_scale = st.slider("Guidance Scale:", min_value=1.0, max_value=20.0, value=3.5, step=0.1)
+        safety_tolerance = st.selectbox("Safety Tolerance:", ["1", "2", "3", "4"], index=1)
 
-    default_prompt = (
-        "a photo of a forest with mist swirling around the tree trunks. The word "
-        '"FLUX" is painted over it in big, red brush strokes with visible texture'
-    )
-    prompt = st_keyup("Enter a prompt", value=default_prompt, debounce=300, key="interactive_text")
+    # Initialize session state
+    if 'user_prompt' not in st.session_state:
+        st.session_state.user_prompt = ""
+    if 'tuned_prompt' not in st.session_state:
+        st.session_state.tuned_prompt = ""
+    if 'prompt_accepted' not in st.session_state:
+        st.session_state.prompt_accepted = False
 
-    output_name = os.path.join(output_dir, "img_{idx}.jpg")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-        idx = 0
-    else:
-        fns = [fn for fn in iglob(output_name.format(idx="*")) if re.search(r"img_[0-9]+\.jpg$", fn)]
-        if len(fns) > 0:
-            idx = max(int(fn.split("_")[-1].split(".")[0]) for fn in fns) + 1
+    # User input for the prompt
+    user_prompt = st.text_input("Enter your image prompt:", value=st.session_state.user_prompt)
+
+    # Update session state when user types in the input field
+    if user_prompt != st.session_state.user_prompt:
+        st.session_state.user_prompt = user_prompt
+        st.session_state.prompt_accepted = False
+
+    # OpenAI prompt tuning options
+    use_openai_tuning = st.checkbox("Use OpenAI for prompt tuning", value=False)
+    
+    openai_model_options = ["gpt-4o", "gpt-4o-mini"]
+    selected_openai_model = st.selectbox("Select OpenAI Model:", openai_model_options, index=0, disabled=not use_openai_tuning)
+
+    if use_openai_tuning and user_prompt:
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("OPENAI_API_KEY environment variable is not set. Please set it before using OpenAI tuning.")
         else:
-            idx = 0
+            if st.button("✏️ Tune Prompt"):
+                with st.spinner("Tuning prompt with OpenAI..."):
+                    try:
+                        tuned_result = tune_prompt_with_openai(user_prompt, selected_openai_model)
+                        
+                        # Split the result into prompt, explanation, and suggestions
+                        sections = tuned_result.split('\n')
+                        for section in sections:
+                            if section.startswith("PROMPT:"):
+                                st.session_state.tuned_prompt = section.replace("PROMPT:", "").strip()
+                            elif section.startswith("EXPLANATION:"):
+                                explanation = section.replace("EXPLANATION:", "").strip()
+                            elif section.startswith("SUGGESTIONS:"):
+                                suggestions = section.replace("SUGGESTIONS:", "").strip()
+                        
+                        # Display the tuned prompt
+                        st.subheader("Tuned Prompt:")
+                        st.write(st.session_state.tuned_prompt)
+                        
+                        # Display explanation and suggestions in an expander
+                        with st.expander("See explanation and suggestions"):
+                            st.write("Explanation of changes:")
+                            st.write(explanation)
+                            st.write("Additional suggestions:")
+                            st.write(suggestions)
+                        
+                        # Allow user to accept or regenerate the tuned prompt
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.button("✅ Accept Tuned Prompt", on_click=accept_tuned_prompt)
+                        with col2:
+                            if st.button("♻️ Regenerate Prompt"):
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"Error tuning prompt: {str(e)}")
 
-    rng = torch.Generator(device="cpu")
+    if st.session_state.prompt_accepted:
+        st.success("👍 Tuned prompt accepted and updated in the input field.")
 
-    if "seed" not in st.session_state:
-        st.session_state.seed = rng.seed()
+    if st.button("☁️ Generate Image"):
+        if not user_prompt:
+            st.warning("⛔️ Please enter a prompt for image generation.")
+            return
 
-    def increment_counter():
-        st.session_state.seed += 1
+        # Display the prompt being used
+        st.subheader("☁️ Generating image with the following prompt:")
+        st.info(user_prompt)
 
-    def decrement_counter():
-        if st.session_state.seed > 0:
-            st.session_state.seed -= 1
+        # Generate image with fal.ai
+        try:
+            spinner_placeholder = st.empty()
+            message_cycle = cycle_spinner_messages()
 
-    opts = SamplingOptions(
-        prompt=prompt,
-        width=width,
-        height=height,
-        num_steps=num_steps,
-        guidance=guidance,
-        seed=seed,
-    )
+            async def generate_image_task():
+                return await generate_image_with_fal(
+                    user_prompt, model_options[selected_model],
+                    image_size, num_inference_steps, guidance_scale, num_images=1, safety_tolerance=safety_tolerance
+                )
 
-    if name == "flux-schnell":
-        cols = st.columns([5, 1, 1, 5])
-        with cols[1]:
-            st.button("↩", on_click=increment_counter)
-        with cols[2]:
-            st.button("↪", on_click=decrement_counter)
-    if is_schnell or st.button("Sample"):
-        if is_schnell:
-            opts.seed = st.session_state.seed
-        elif opts.seed is None:
-            opts.seed = rng.seed()
-        print(f"Generating '{opts.prompt}' with seed {opts.seed}")
-        t0 = time.perf_counter()
+            async def run_with_spinner(generation_coroutine):
+                task = asyncio.create_task(generation_coroutine)
+                while not task.done():
+                    spinner_placeholder.text(next(message_cycle))
+                    await asyncio.sleep(3)
+                return await task
 
-        if init_image is not None:
-            if resize_img:
-                init_image = torch.nn.functional.interpolate(init_image, (opts.height, opts.width))
+            # Run the asynchronous code within the synchronous Streamlit environment
+            result = asyncio.run(run_with_spinner(generate_image_task()))
+
+            spinner_placeholder.empty()  # Clear the spinner
+
+            # Display the generated image and save it along with Markdown data
+            st.subheader("🖼️ Your Generated Masterpiece:")
+            image_info = result['images'][0]  # We know there's only one image
+            st.image(image_info['url'], caption="Generated Image", use_column_width=True)
+
+            # Display additional information
+            st.write(f"🌱 Seed: {result['seed']}")
+            st.write(f"🚫 NSFW concepts detected: {result['has_nsfw_concepts']}")
+            
+            # Save the image and Markdown data
+            saved_image_path, saved_markdown_path = save_image_and_markdown(
+                image_info['url'], 
+                user_prompt, 
+                result, 
+                selected_model, 
+                image_size, 
+                num_inference_steps, 
+                guidance_scale, 
+                safety_tolerance
+            )
+            if saved_image_path and saved_markdown_path:
+                st.success(f"Image saved to {saved_image_path}")
+                st.success(f"Generation details saved to {saved_markdown_path}")
+                
+                # Display the content of the Markdown file
+                with open(saved_markdown_path, 'r', encoding='utf-8') as md_file:
+                    markdown_content = md_file.read()
+                st.markdown(markdown_content)
             else:
-                h, w = init_image.shape[-2:]
-                init_image = init_image[..., : 16 * (h // 16), : 16 * (w // 16)]
-                opts.height = init_image.shape[-2]
-                opts.width = init_image.shape[-1]
-            if offload:
-                ae.encoder.to(torch_device)
-            init_image = ae.encode(init_image.to(torch_device))
-            if offload:
-                ae = ae.cpu()
-                torch.cuda.empty_cache()
-
-        # prepare input
-        x = get_noise(
-            1,
-            opts.height,
-            opts.width,
-            device=torch_device,
-            dtype=torch.bfloat16,
-            seed=opts.seed,
-        )
-        # divide pixel space by 16**2 to account for latent space conversion
-        timesteps = get_schedule(
-            opts.num_steps,
-            (x.shape[-1] * x.shape[-2]) // 4,
-            shift=(not is_schnell),
-        )
-        if init_image is not None:
-            t_idx = int((1 - image2image_strength) * num_steps)
-            t = timesteps[t_idx]
-            timesteps = timesteps[t_idx:]
-            x = t * x + (1.0 - t) * init_image.to(x.dtype)
-
-        if offload:
-            t5, clip = t5.to(torch_device), clip.to(torch_device)
-        inp = prepare(t5=t5, clip=clip, img=x, prompt=opts.prompt)
-
-        # offload TEs to CPU, load model to gpu
-        if offload:
-            t5, clip = t5.cpu(), clip.cpu()
-            torch.cuda.empty_cache()
-            model = model.to(torch_device)
-
-        # denoise initial noise
-        x = denoise(model, **inp, timesteps=timesteps, guidance=opts.guidance)
-
-        # offload model, load autoencoder to gpu
-        if offload:
-            model.cpu()
-            torch.cuda.empty_cache()
-            ae.decoder.to(x.device)
-
-        # decode latents to pixel space
-        x = unpack(x.float(), opts.height, opts.width)
-        with torch.autocast(device_type=torch_device.type, dtype=torch.bfloat16):
-            x = ae.decode(x)
-
-        if offload:
-            ae.decoder.cpu()
-            torch.cuda.empty_cache()
-
-        t1 = time.perf_counter()
-
-        fn = output_name.format(idx=idx)
-        print(f"Done in {t1 - t0:.1f}s.")
-        # bring into PIL format and save
-        x = x.clamp(-1, 1)
-        x = embed_watermark(x.float())
-        x = rearrange(x[0], "c h w -> h w c")
-
-        img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
-        nsfw_score = [x["score"] for x in nsfw_classifier(img) if x["label"] == "nsfw"][0]
-
-        if nsfw_score < NSFW_THRESHOLD:
-            buffer = BytesIO()
-            exif_data = Image.Exif()
-            if init_image is None:
-                exif_data[ExifTags.Base.Software] = "AI generated;txt2img;flux"
-            else:
-                exif_data[ExifTags.Base.Software] = "AI generated;img2img;flux"
-            exif_data[ExifTags.Base.Make] = "Black Forest Labs"
-            exif_data[ExifTags.Base.Model] = name
-            if add_sampling_metadata:
-                exif_data[ExifTags.Base.ImageDescription] = prompt
-            img.save(buffer, format="jpeg", exif=exif_data, quality=95, subsampling=0)
-
-            img_bytes = buffer.getvalue()
-            if save_samples:
-                print(f"Saving {fn}")
-                with open(fn, "wb") as file:
-                    file.write(img_bytes)
-                idx += 1
-
-            st.session_state["samples"] = {
-                "prompt": opts.prompt,
-                "img": img,
-                "seed": opts.seed,
-                "bytes": img_bytes,
-            }
-            opts.seed = None
-        else:
-            st.warning("Your generated image may contain NSFW content.")
-            st.session_state["samples"] = None
-
-    samples = st.session_state.get("samples", None)
-    if samples is not None:
-        st.image(samples["img"], caption=samples["prompt"])
-        st.download_button(
-            "Download full-resolution",
-            samples["bytes"],
-            file_name="generated.jpg",
-            mime="image/jpg",
-        )
-        st.write(f"Seed: {samples['seed']}")
-
-
-def app():
-    Fire(main)
-
+                st.error("Failed to save the image and/or generation details")
+            
+        except Exception as e:
+            st.error(f"⛔️ Error generating image: {str(e)}")
+            print(f"Error details: {e}")  # This will appear in your console/logs
 
 if __name__ == "__main__":
-    app()
+    main()
