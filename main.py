@@ -11,7 +11,7 @@ from io import BytesIO
 from datetime import datetime
 
 def tune_prompt_with_openai(prompt, model):
-    openai_api_key = os.getenv("OPENAI_API_KEY")
+    openai_api_key = "sk-hXpmwqQ6zujHKYCv1_TK0Wtbb-_cWUnLOB-L3BHvcVT3BlbkFJFIccci32Q6yKfVTPHk2YBS3c_trSyRauJEqezo074A"
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY environment variable is not set")
     
@@ -32,7 +32,7 @@ def tune_prompt_with_openai(prompt, model):
     return response.choices[0].message.content.strip()
 
 async def generate_image_with_fal(prompt, model, image_size, num_inference_steps, guidance_scale, num_images, safety_tolerance):
-    fal_api_key = os.getenv("FAL_KEY")
+    fal_api_key = "5de835de-2f76-41f2-b11b-02bafb056857:a9557fac741d4dfd1d16eca237e696e5"
     if not fal_api_key:
         raise ValueError("FAL_KEY environment variable is not set")
     
