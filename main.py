@@ -33,10 +33,10 @@ def tune_prompt_with_openai(prompt, model):
 
 async def generate_image_with_fal(prompt, model, image_size, num_inference_steps, guidance_scale, num_images, safety_tolerance):
     fal_api_key = "5de835de-2f76-41f2-b11b-02bafb056857:a9557fac741d4dfd1d16eca237e696e5"
+    os.environ['FAL_KEY'] = fal_api_key
     if not fal_api_key:
         raise ValueError("FAL_KEY environment variable is not set")
-    
-    os.environ['FAL_KEY'] = fal_api_key  # Set the API key as an environment variable
+  # Set the API key as an environment variable
     
     handler = await fal_client.submit_async(
         model,
