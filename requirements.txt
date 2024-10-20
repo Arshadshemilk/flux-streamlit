@@ -8,3 +8,4 @@ streamlit-keyup
 torchvision
 transformers
 invisible-watermark
+opencv-python-headless
