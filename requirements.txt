@@ -7,4 +7,4 @@ pillow
 streamlit-keyup
 torchvision
 transformers
-imWatermark
+invisible-watermark
