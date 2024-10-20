@@ -9,6 +9,7 @@ import requests
 from PIL import Image
 from io import BytesIO
 from datetime import datetime
+from dotenv import dotenv_values
 
 def tune_prompt_with_openai(prompt, model):
     
