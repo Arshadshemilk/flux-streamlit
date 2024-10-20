@@ -14,4 +14,3 @@ safetensors
 tokenizers
 huggingface-hub
 requests
-protobuf
