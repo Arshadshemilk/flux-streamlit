@@ -305,4 +305,5 @@ def main():
             print(f"Error details: {e}")  # This will appear in your console/logs
 
 if __name__ == "__main__":
+    secrets = st.secrets
     main()
